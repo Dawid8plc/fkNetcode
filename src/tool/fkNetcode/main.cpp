@@ -7,14 +7,122 @@
 #include "fkUtils.h"
 #include "PEInfo.h"
 
+#include <fstream>
+
 // ---- Configuration ----
 
 CHAR cfgFallbackIP[16];
 CHAR cfgServiceUrl[MAX_PATH];
 BOOL cfgShowErrors;
 
+// ---- Patch: IP Resolval ----
+
+CHAR cachedIP[16] = {};
+
+void configure();
+
+struct ThreadData {
+	HANDLE directoryHandle;
+	const wchar_t* directoryPath;
+	const wchar_t* targetFileName;
+};
+
+void MonitorDirectoryThread(void* data) {
+	struct ThreadData* threadData = (struct ThreadData*)data;
+	HANDLE directoryHandle = threadData->directoryHandle;
+	const wchar_t* directoryPath = threadData->directoryPath;
+	const wchar_t* targetFileName = threadData->targetFileName;
+
+	// Buffer to store the changes
+	const int bufferSize = 4096;
+	BYTE buffer[4096];
+
+	DWORD bytesRead;
+	FILE_NOTIFY_INFORMATION* fileInfo;
+
+	while (ReadDirectoryChangesW(
+		directoryHandle,
+		buffer,
+		bufferSize,
+		FALSE, // Ignore subtree
+		FILE_NOTIFY_CHANGE_LAST_WRITE, // Monitor file write changes
+		&bytesRead,
+		NULL,
+		NULL
+	)) {
+		fileInfo = (FILE_NOTIFY_INFORMATION*)buffer;
+
+		//Make sure that the file that got written to is the file we are monitoring
+		if (wcsncmp(fileInfo->FileName, targetFileName, fileInfo->FileNameLength / sizeof(wchar_t)) != 0)
+			continue;
+
+		do {
+
+			switch (fileInfo->Action) {
+			case FILE_ACTION_MODIFIED:
+				configure();
+				break;
+			default:
+				break;
+			}
+
+			// Move to the next entry in the buffer
+			fileInfo = (FILE_NOTIFY_INFORMATION*)((char*)fileInfo + fileInfo->NextEntryOffset);
+
+		} while (fileInfo->NextEntryOffset != 0);
+	}
+
+	// Close the directory handle when the monitoring loop exits
+	CloseHandle(directoryHandle);
+}
+
+void MonitorDirectory(const wchar_t* directoryPath, const wchar_t* targetFileName)
+{
+	// Create a directory handle
+	HANDLE directoryHandle = CreateFileW(
+		directoryPath,
+		FILE_LIST_DIRECTORY,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS,
+		NULL
+	);
+
+	if (directoryHandle == INVALID_HANDLE_VALUE) {
+		wprintf(L"Error opening directory: %d\n", GetLastError());
+		return;
+	}
+
+	// Prepare data to pass to the thread
+	struct ThreadData* threadData = (struct ThreadData*)malloc(sizeof(struct ThreadData));
+	if (threadData == NULL) {
+		wprintf(L"Memory allocation failed\n");
+		CloseHandle(directoryHandle);
+		return;
+	}
+	threadData->directoryHandle = directoryHandle;
+	threadData->directoryPath = directoryPath;
+	threadData->targetFileName = targetFileName;
+
+	// Create a thread for monitoring
+	HANDLE threadHandle = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)MonitorDirectoryThread, threadData, 0, NULL);
+
+	//Closes the handle to the thread, however this does not stop the thread
+	CloseHandle(threadHandle);
+}
+
+inline bool fileExists(const std::string& name) {
+	std::ifstream file(name);
+	return file.good();
+}
+
 void configure()
 {
+	if (cachedIP[0]) {
+		cachedIP[0] = NULL;
+	}
+
 	fk::Config config("fkNetcode.ini");
 
 	// Load INI settings.
@@ -23,9 +131,14 @@ void configure()
 	config.get("AddressResolval", "ShowErrors", cfgShowErrors, TRUE);
 
 	// Ensure INI file has been created with default setting.
-	config.set("AddressResolval", "FallbackIP", cfgFallbackIP);
-	config.set("AddressResolval", "ServiceUrl", cfgServiceUrl);
-	config.set("AddressResolval", "ShowErrors", cfgShowErrors);
+	bool exists = fileExists("fkNetcode.ini");
+
+	if (!exists)
+	{
+		config.set("AddressResolval", "FallbackIP", cfgFallbackIP);
+		config.set("AddressResolval", "ServiceUrl", cfgServiceUrl);
+		config.set("AddressResolval", "ShowErrors", cfgShowErrors);
+	}
 
 	// Validate fallback IP.
 	BYTE b;
@@ -35,10 +148,6 @@ void configure()
 		MessageBox(NULL, "Invalid fallback IP setting in fkNetcode.ini has been ignored.", "fkNetcode", MB_ICONWARNING);
 	}
 }
-
-// ---- Patch: IP Resolval ----
-
-CHAR cachedIP[16] = {};
 
 bool resolveIPCached(LPSTR buffer)
 {
@@ -172,6 +281,12 @@ BOOL WINAPI DllMain(HMODULE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 			{
 				configure();
 				patch(pe, version);
+
+				//Gets the current working directory, and creates a path containing it and the fkNetcode.ini file that we want to monitor for changes
+				wchar_t directoryPath[1024];
+				_wgetcwd(directoryPath, sizeof(directoryPath) / sizeof(directoryPath[0]));
+				const wchar_t* targetFileName = L"fkNetcode.ini";
+				MonitorDirectory(directoryPath, targetFileName);
 			}
 		}
 		break;
